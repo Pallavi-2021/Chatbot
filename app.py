@@ -1,11 +1,10 @@
 """
-Sales Visit Intelligence — Single-File Deployment
-===================================================
-Everything in one file: data processing, scoring, document generation,
-RAG pipeline, Gemini chatbot, and Streamlit UI.
-No utils/ folder needed. No module import errors possible.
+Sales Visit Intelligence — Streamlit Cloud Edition
+====================================================
+Single file. No utils/ folder. No heavy dependencies.
+All errors shown in the UI (never a blank crash page).
 
-To deploy: upload only this file + requirements.txt to Streamlit Cloud.
+Requirements: streamlit, pandas, numpy, plotly, openpyxl, google-genai
 """
 
 import gc
@@ -14,6 +13,7 @@ import os
 import re
 import time
 import hashlib
+import traceback
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -23,50 +23,85 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION  —  put your Gemini API key here
+# CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-GEMINI_API_KEY = "your-gemini-api-key-here"   # ← paste your key
+GEMINI_API_KEY = "your-gemini-api-key-here"  # ← paste key here, OR use Streamlit secrets
 GEMINI_MODEL   = "gemini-2.5-flash"
 
-def _get_api_key() -> Optional[str]:
-    if GEMINI_API_KEY and GEMINI_API_KEY != "your-gemini-api-key-here":
+def get_key() -> Optional[str]:
+    # 1. hardcoded above
+    if GEMINI_API_KEY and "your-gemini" not in GEMINI_API_KEY:
         return GEMINI_API_KEY
+    # 2. Streamlit secrets
     try:
-        if "GEMINI_API_KEY" in st.secrets:
-            return st.secrets["GEMINI_API_KEY"]
+        v = st.secrets.get("GEMINI_API_KEY")
+        if v: return v
     except Exception:
         pass
+    # 3. environment variable
     return os.environ.get("GEMINI_API_KEY")
 
+def get_model() -> str:
+    try:
+        v = st.secrets.get("GEMINI_MODEL")
+        if v: return str(v).strip()
+    except Exception:
+        pass
+    return os.environ.get("GEMINI_MODEL", GEMINI_MODEL)
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SCHEMA CONSTANTS
+# PAGE SETUP
 # ══════════════════════════════════════════════════════════════════════════════
 
-PLANNED_REQUIRED = ["DistributorCode", "SRCode", "Date", "StoreID", "PlannedCalls"]
-ACTUAL_REQUIRED  = ["DistributorCode", "SRCode", "Date", "StoreID",
-                    "VisitStatus", "VisitLatitude", "VisitLongitude",
-                    "StoreLatitude", "StoreLongitude"]
+st.set_page_config(
+    page_title="Sales Visit Intelligence",
+    layout="wide", page_icon="🤖",
+    initial_sidebar_state="expanded",
+)
 
-_KNOWN_COLS = {
-    "DistributorCode","DistributorName","SRCode","Date","TimeIn","TimeOut",
-    "CallDur","StoreIDREF","StoreID","StoreName","VisitStatus","TotalCalls",
-    "VisitLatitude","VisitLongitude","StoreLatitude","StoreLongitude",
-    "STOREGPSUPDATED","VisitType","MonthPeriod","GPSDistanceMeters",
-    "GPSMismatch","WasPlanned","IsOffRoute",
-}
+st.markdown("""
+<style>
+[data-testid="stAppViewContainer"]{background:#f7f8fa}
+[data-testid="stSidebar"]{background:#fff;border-right:1px solid #e8eaed}
+.kpi-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.kpi-card{background:#fff;border-radius:10px;padding:14px 18px;flex:1;
+          min-width:130px;box-shadow:0 1px 4px rgba(0,0,0,.07);
+          border-left:4px solid #4f8ef7}
+.kpi-card.red{border-left-color:#e53935}.kpi-card.amber{border-left-color:#fb8c00}
+.kpi-card.green{border-left-color:#43a047}
+.kpi-label{font-size:11px;color:#888;font-weight:700;
+           text-transform:uppercase;letter-spacing:.05em}
+.kpi-value{font-size:24px;font-weight:800;color:#1a1a2e;line-height:1.2}
+.kpi-sub{font-size:11px;color:#bbb;margin-top:2px}
+.sr-row{display:flex;justify-content:space-between;align-items:center;
+        padding:6px 0;border-bottom:1px solid #f0f0f0;font-size:13px}
+.sr-row:last-child{border-bottom:none}
+</style>""", unsafe_allow_html=True)
+
+# session state defaults
+for k, v in [("result", None), ("store", None), ("chat", None),
+              ("history", []), ("model_used", "")]:
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def read_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    buf = io.BytesIO(file_bytes)
-    if filename.lower().endswith((".xlsx", ".xls")):
-        return pd.read_excel(buf)
-    return pd.read_csv(buf)
+PLAN_COLS   = ["DistributorCode","SRCode","Date","StoreID","PlannedCalls"]
+ACTUAL_COLS = ["DistributorCode","SRCode","Date","StoreID","VisitStatus",
+               "VisitLatitude","VisitLongitude","StoreLatitude","StoreLongitude"]
+_SKIP = {"DistributorCode","DistributorName","SRCode","Date","TimeIn","TimeOut",
+         "CallDur","StoreIDREF","StoreID","StoreName","VisitStatus","TotalCalls",
+         "VisitLatitude","VisitLongitude","StoreLatitude","StoreLongitude",
+         "STOREGPSUPDATED","VisitType","MonthPeriod"}
 
-def validate(df: pd.DataFrame, required: list[str]) -> list[str]:
+def load_file(b: bytes, name: str) -> pd.DataFrame:
+    buf = io.BytesIO(b)
+    return pd.read_excel(buf) if name.lower().endswith((".xlsx",".xls")) else pd.read_csv(buf)
+
+def missing_cols(df, required):
     return [c for c in required if c not in df.columns]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -75,835 +110,690 @@ def validate(df: pd.DataFrame, required: list[str]) -> list[str]:
 
 @dataclass
 class Schema:
-    route_source:       Optional[str]  = None
-    role_cols:          list[str]      = field(default_factory=list)
-    asm_col:            Optional[str]  = None
-    supervisor_col:     Optional[str]  = None
-    has_gps_updated:    bool           = False
-    has_call_duration:  bool           = False
-    product_cols:       list[str]      = field(default_factory=list)
+    route_source:    str        = "planned_match"
+    role_cols:       list       = field(default_factory=list)
+    asm_col:         str        = ""
+    supervisor_col:  str        = ""
+    has_gps_flag:    bool       = False
+    has_call_dur:    bool       = False
 
-def detect_schema(df: pd.DataFrame) -> Schema:
+def detect(df: pd.DataFrame) -> Schema:
+    s = Schema()
     cols = set(df.columns)
-    s    = Schema()
-    if "VisitType"   in cols: s.route_source = "VisitType"
+    if "VisitType"    in cols: s.route_source = "VisitType"
     elif "StoreIDREF" in cols: s.route_source = "StoreIDREF"
-    else:                      s.route_source = "planned_match"
-    for col in df.columns:
-        cl = col.lower()
-        if col.startswith("Role_") or col.startswith("role_"):
-            s.role_cols.append(col)
-            if "assistant" in cl or "asm" in cl: s.asm_col = col
-            elif "supervisor" in cl:             s.supervisor_col = col
-    s.has_gps_updated   = "STOREGPSUPDATED" in cols
-    s.has_call_duration = "CallDur" in cols
-    s.product_cols      = [c for c in df.columns
-                           if c not in _KNOWN_COLS and c not in s.role_cols
-                           and pd.api.types.is_numeric_dtype(df[c])]
+    for c in df.columns:
+        cl = c.lower()
+        if c.startswith("Role_") or c.startswith("role_"):
+            s.role_cols.append(c)
+            if "assistant" in cl or "asm" in cl: s.asm_col = c
+            elif "supervisor" in cl:             s.supervisor_col = c
+    s.has_gps_flag = "STOREGPSUPDATED" in cols
+    s.has_call_dur = "CallDur" in cols
     return s
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COERCION & GPS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def coerce(planned: pd.DataFrame, actual: pd.DataFrame):
-    for df in (planned, actual):
+def prep(p: pd.DataFrame, a: pd.DataFrame):
+    for df in (p, a):
         df["Date"]            = pd.to_datetime(df["Date"], errors="coerce")
         df["SRCode"]          = df["SRCode"].astype(str).str.strip()
         df["DistributorCode"] = df["DistributorCode"].astype(str).str.strip()
         df["StoreID"]         = df["StoreID"].astype(str).str.strip()
         df["MonthPeriod"]     = df["Date"].dt.to_period("M").astype(str)
-    planned["PlannedCalls"] = pd.to_numeric(planned["PlannedCalls"], errors="coerce")
-    for col in ["CallDur","TotalCalls","VisitLatitude","VisitLongitude",
-                "StoreLatitude","StoreLongitude"]:
-        if col in actual.columns:
-            actual[col] = pd.to_numeric(actual[col], errors="coerce")
-    return planned, actual
+    p["PlannedCalls"] = pd.to_numeric(p["PlannedCalls"], errors="coerce")
+    for c in ["CallDur","TotalCalls","VisitLatitude","VisitLongitude",
+              "StoreLatitude","StoreLongitude"]:
+        if c in a.columns:
+            a[c] = pd.to_numeric(a[c], errors="coerce")
+    return p, a
 
-def haversine(lat1, lon1, lat2, lon2) -> np.ndarray:
-    R = 6_371_000.0
-    rl = np.radians
-    a = (np.sin((rl(lat2)-rl(lat1))/2)**2
-         + np.cos(rl(lat1))*np.cos(rl(lat2))*np.sin((rl(lon2)-rl(lon1))/2)**2)
-    return R * 2 * np.arcsin(np.minimum(1.0, np.sqrt(a)))
-
-def add_gps_dist(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["GPSDistanceMeters"] = haversine(
-        out["VisitLatitude"], out["VisitLongitude"],
-        out["StoreLatitude"], out["StoreLongitude"])
-    return out
+def hav(la1, lo1, la2, lo2):
+    R=6371000.0; r=np.radians
+    a=(np.sin((r(la2)-r(la1))/2)**2
+       +np.cos(r(la1))*np.cos(r(la2))*np.sin((r(lo2)-r(lo1))/2)**2)
+    return R*2*np.arcsin(np.minimum(1.0,np.sqrt(a)))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ANALYTICS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compliance_table(planned, actual):
-    pg = planned.groupby(["SRCode","DistributorCode","MonthPeriod"], as_index=False).agg(
-        PlannedVisits=("StoreID","nunique"), PlannedCallsSum=("PlannedCalls","sum"))
-    done = actual[actual["VisitStatus"].astype(str).str.lower() == "completed"]
-    ag = done.groupby(["SRCode","DistributorCode","MonthPeriod"], as_index=False).agg(
-        CompletedVisits=("StoreID","nunique"))
+def calc_compliance(p, a):
+    pg = p.groupby(["SRCode","DistributorCode","MonthPeriod"],as_index=False).agg(
+        Planned=("StoreID","nunique"), PlanCalls=("PlannedCalls","sum"))
+    done = a[a["VisitStatus"].astype(str).str.lower()=="completed"]
+    ag = done.groupby(["SRCode","DistributorCode","MonthPeriod"],as_index=False).agg(
+        Completed=("StoreID","nunique"))
     m = pg.merge(ag, on=["SRCode","DistributorCode","MonthPeriod"], how="outer")
-    m[["PlannedVisits","CompletedVisits"]] = m[["PlannedVisits","CompletedVisits"]].fillna(0)
-    m["CompliancePct"]  = np.where(m["PlannedVisits"]>0,
-        (m["CompletedVisits"]/m["PlannedVisits"])*100, np.nan)
-    m["MissedVisits"]   = (m["PlannedVisits"]-m["CompletedVisits"]).clip(lower=0)
-    return m.sort_values(["SRCode","MonthPeriod"])
+    m[["Planned","Completed"]] = m[["Planned","Completed"]].fillna(0)
+    m["CompliancePct"] = np.where(m["Planned"]>0, m["Completed"]/m["Planned"]*100, np.nan)
+    m["Missed"]        = (m["Planned"]-m["Completed"]).clip(lower=0)
+    return m.rename(columns={"Planned":"PlannedVisits","Completed":"CompletedVisits",
+                              "Missed":"MissedVisits"})
 
-def route_table(planned, actual, schema: Schema) -> Optional[pd.DataFrame]:
-    a = actual.copy()
-    if schema.route_source == "VisitType":
-        vt = a["VisitType"].astype(str).str.lower()
-        a["IsOffRoute"] = vt.isin(["offroute","off route","off_route"])
-    elif schema.route_source == "StoreIDREF":
-        a["StoreIDREF"] = a["StoreIDREF"].astype(str).str.strip()
-        a["IsOffRoute"] = a["StoreID"] != a["StoreIDREF"]
+def calc_route(p, a, schema: Schema):
+    a2 = a.copy()
+    if schema.route_source=="VisitType":
+        a2["Off"] = a2["VisitType"].astype(str).str.lower().isin(
+            ["offroute","off route","off_route"])
+    elif schema.route_source=="StoreIDREF":
+        a2["Off"] = a2["StoreID"] != a2["StoreIDREF"].astype(str).str.strip()
     else:
-        pairs = set(planned["SRCode"]+"|"+planned["Date"].dt.strftime("%Y-%m-%d")+"|"+planned["StoreID"])
-        a["IsOffRoute"] = ~(a["SRCode"]+"|"+a["Date"].dt.strftime("%Y-%m-%d")+"|"+a["StoreID"]).isin(pairs)
-    g = a.groupby(["SRCode","DistributorCode","MonthPeriod"], as_index=False).agg(
-        TotalVisits=("StoreID","count"), OffRouteVisits=("IsOffRoute","sum"))
+        keys = set(p["SRCode"]+"|"+p["Date"].dt.strftime("%Y-%m-%d")+"|"+p["StoreID"])
+        a2["Off"] = ~(a2["SRCode"]+"|"+a2["Date"].dt.strftime("%Y-%m-%d")+"|"+a2["StoreID"]).isin(keys)
+    g = a2.groupby(["SRCode","DistributorCode","MonthPeriod"],as_index=False).agg(
+        TotalVisits=("StoreID","count"), OffRouteVisits=("Off","sum"))
     g["OffRoutePct"] = np.where(g["TotalVisits"]>0,
-        (g["OffRouteVisits"]/g["TotalVisits"])*100, np.nan)
-    return g.sort_values(["SRCode","MonthPeriod"])
-
-def gps_table(actual, threshold: float):
-    a = add_gps_dist(actual)
-    a["GPSMismatch"] = a["GPSDistanceMeters"] > threshold
-    g = a.groupby(["SRCode","DistributorCode","MonthPeriod"], as_index=False).agg(
-        TotalVisits=("StoreID","count"), GPSMismatches=("GPSMismatch","sum"),
-        AvgGPSDistance=("GPSDistanceMeters","mean"),
-        MaxGPSDistance=("GPSDistanceMeters","max"))
-    g["GPSMismatchPct"] = np.where(g["TotalVisits"]>0,
-        (g["GPSMismatches"]/g["TotalVisits"])*100, np.nan)
+        g["OffRouteVisits"]/g["TotalVisits"]*100, np.nan)
     return g
 
-def store_miss_table(planned, actual):
-    pg = planned.groupby(["StoreID","DistributorCode"], as_index=False).agg(
+def calc_gps(a, thresh):
+    a2 = a.copy()
+    a2["Dist"] = hav(a2["VisitLatitude"],a2["VisitLongitude"],
+                     a2["StoreLatitude"],a2["StoreLongitude"])
+    a2["Miss"] = a2["Dist"]>thresh
+    g = a2.groupby(["SRCode","DistributorCode","MonthPeriod"],as_index=False).agg(
+        TotalVisits=("StoreID","count"), GPSMismatches=("Miss","sum"),
+        AvgDist=("Dist","mean"), MaxDist=("Dist","max"))
+    g["GPSMismatchPct"] = np.where(g["TotalVisits"]>0,
+        g["GPSMismatches"]/g["TotalVisits"]*100, np.nan)
+    return g
+
+def calc_miss(p, a):
+    pg = p.groupby(["StoreID","DistributorCode"],as_index=False).agg(
         TimesPlanned=("Date","nunique"))
-    done = actual[actual["VisitStatus"].astype(str).str.lower()=="completed"]
-    ag = done.groupby(["StoreID","DistributorCode"], as_index=False).agg(
+    done = a[a["VisitStatus"].astype(str).str.lower()=="completed"]
+    ag = done.groupby(["StoreID","DistributorCode"],as_index=False).agg(
         TimesCompleted=("Date","nunique"))
     m = pg.merge(ag, on=["StoreID","DistributorCode"], how="left")
     m["TimesCompleted"] = m["TimesCompleted"].fillna(0)
     m["TimesMissed"]    = (m["TimesPlanned"]-m["TimesCompleted"]).clip(lower=0)
     m["MissRate"]       = np.where(m["TimesPlanned"]>0,
-        (m["TimesMissed"]/m["TimesPlanned"])*100, np.nan)
+        m["TimesMissed"]/m["TimesPlanned"]*100, np.nan)
     return m.sort_values("TimesMissed", ascending=False)
 
-def monthly_summary(comp, route, gps):
-    c = comp.groupby("MonthPeriod",as_index=False).agg(
-        AvgCompliancePct=("CompliancePct","mean"),
-        TotalPlanned=("PlannedVisits","sum"),
-        TotalCompleted=("CompletedVisits","sum"))
-    g = gps.groupby("MonthPeriod",as_index=False).agg(
-        AvgGPSMismatchPct=("GPSMismatchPct","mean"))
-    out = c.merge(g, on="MonthPeriod", how="outer")
-    if route is not None:
-        r = route.groupby("MonthPeriod",as_index=False).agg(
-            AvgOffRoutePct=("OffRoutePct","mean"))
-        out = out.merge(r, on="MonthPeriod", how="outer")
-    return out.sort_values("MonthPeriod")
-
-def distributor_summary(comp, route, gps):
-    c = comp.groupby("DistributorCode",as_index=False).agg(
-        AvgCompliancePct=("CompliancePct","mean"))
-    g = gps.groupby("DistributorCode",as_index=False).agg(
-        AvgGPSMismatchPct=("GPSMismatchPct","mean"))
-    out = c.merge(g, on="DistributorCode", how="outer")
-    if route is not None:
-        r = route.groupby("DistributorCode",as_index=False).agg(
-            AvgOffRoutePct=("OffRoutePct","mean"))
-        out = out.merge(r, on="DistributorCode", how="outer")
-    return out.sort_values("AvgCompliancePct")
-
-def role_analytics(actual, comp, gps, schema: Schema) -> dict:
-    res = {}
-    if not schema.role_cols:
-        return res
-    role_map = actual[["SRCode"]+schema.role_cols].drop_duplicates("SRCode")
-    for rc in schema.role_cols:
-        cg = comp.merge(role_map[["SRCode",rc]], on="SRCode", how="left")
-        gg = gps.merge(role_map[["SRCode",rc]], on="SRCode", how="left")
-        c2 = cg.groupby(rc,as_index=False).agg(
-            AvgCompliancePct=("CompliancePct","mean"),
-            TotalPlanned=("PlannedVisits","sum"),
-            TotalCompleted=("CompletedVisits","sum"),
-            SRCount=("SRCode","nunique"))
-        g2 = gg.groupby(rc,as_index=False).agg(
-            AvgGPSMismatchPct=("GPSMismatchPct","mean"))
-        res[rc] = c2.merge(g2, on=rc, how="outer").sort_values("AvgCompliancePct")
-    return res
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BEHAVIOUR SCORING
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _norm(s: pd.Series) -> pd.Series:
+def norm(s):
     lo,hi = s.min(),s.max()
-    if hi==lo or s.dropna().empty:
-        return pd.Series(50.0, index=s.index)
+    if hi==lo or s.dropna().empty: return pd.Series(50.0,index=s.index)
     return (s-lo)/(hi-lo)*100
 
-def behaviour_scores(comp, route, gps) -> pd.DataFrame:
-    df = comp.merge(gps, on=["SRCode","DistributorCode","MonthPeriod"],
-                    how="outer", suffixes=("","_g"))
-    has_route = route is not None
-    if has_route:
-        df = df.merge(route, on=["SRCode","DistributorCode","MonthPeriod"],
-                      how="outer", suffixes=("","_r"))
-        df["RouteNorm"] = _norm(100-df["OffRoutePct"])
-    df["CN"] = _norm(df["CompliancePct"])
-    df["GN"] = _norm(100-df["GPSMismatchPct"])
-    vol      = df.groupby("SRCode")["CompliancePct"].transform(
-        lambda x: x.std(ddof=0)).fillna(0)
-    df["XN"] = 100-_norm(vol)
-    if has_route:
-        df["BehaviourScore"] = (df["CN"]*0.35+df["RouteNorm"]*0.25
-                                +df["GN"]*0.25+df["XN"]*0.15).round(1)
+def calc_scores(comp, route, gps):
+    df = comp.merge(gps,on=["SRCode","DistributorCode","MonthPeriod"],how="outer")
+    has_r = route is not None
+    if has_r:
+        df = df.merge(route,on=["SRCode","DistributorCode","MonthPeriod"],how="outer")
+        df["RN"] = norm(100-df.get("OffRoutePct", pd.Series(0,index=df.index)))
+    df["CN"] = norm(df["CompliancePct"])
+    df["GN"] = norm(100-df["GPSMismatchPct"])
+    df["XN"] = 100 - norm(df.groupby("SRCode")["CompliancePct"]
+                          .transform(lambda x: x.std(ddof=0)).fillna(0))
+    if has_r:
+        df["BehaviourScore"] = (df["CN"]*0.35+df["RN"]*0.25+df["GN"]*0.25+df["XN"]*0.15).round(1)
     else:
         df["BehaviourScore"] = (df["CN"]*0.40+df["GN"]*0.35+df["XN"]*0.25).round(1)
-    df["RiskCategory"] = pd.cut(df["BehaviourScore"],
-        bins=[-np.inf,40,70,np.inf], labels=["High Risk","Medium Risk","Low Risk"])
+    df["RiskCategory"] = pd.cut(df["BehaviourScore"],bins=[-np.inf,40,70,np.inf],
+                                labels=["High Risk","Medium Risk","Low Risk"])
     keep = ["SRCode","DistributorCode","MonthPeriod","CompliancePct",
             "GPSMismatchPct","BehaviourScore","RiskCategory"]
-    if has_route: keep.insert(4,"OffRoutePct")
-    return df[[c for c in keep if c in df.columns]].sort_values(["SRCode","MonthPeriod"])
+    if has_r: keep.insert(4,"OffRoutePct")
+    return df[[c for c in keep if c in df.columns]]
 
-def trend_direction(scores: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for sr, g in scores.groupby("SRCode"):
-        y = g.sort_values("MonthPeriod")["BehaviourScore"].dropna().values
-        if len(y)<2: trend,slope="Insufficient Data",np.nan
+def calc_trend(scores):
+    rows=[]
+    for sr,g in scores.groupby("SRCode"):
+        y=g.sort_values("MonthPeriod")["BehaviourScore"].dropna().values
+        if len(y)<2: t,sl="N/A",np.nan
         else:
-            slope=np.polyfit(np.arange(len(y)),y,1)[0]
-            trend="Improving" if slope>1 else ("Declining" if slope<-1 else "Stable")
-        rows.append({"SRCode":sr,"Slope":slope,"Trend":trend})
+            sl=np.polyfit(np.arange(len(y)),y,1)[0]
+            t="Improving" if sl>1 else ("Declining" if sl<-1 else "Stable")
+        rows.append({"SRCode":sr,"Trend":t,"Slope":sl})
     return pd.DataFrame(rows)
 
-def anomalies(scores: pd.DataFrame, z=1.5) -> pd.DataFrame:
+def calc_anomalies(scores):
     out=[]
     for _,g in scores.groupby("SRCode"):
         g=g.sort_values("MonthPeriod").reset_index(drop=True)
-        d=g["BehaviourScore"].diff(); std=d.std(ddof=0); mean=d.mean()
-        z_=(d-mean)/std if std and not np.isnan(std) else pd.Series(0,index=d.index)
-        g["Delta"]=d; g["ZScore"]=z_; g["IsAnomaly"]=z_<-z
+        d=g["BehaviourScore"].diff()
+        std=d.std(ddof=0); mean=d.mean()
+        z=(d-mean)/std if std and not np.isnan(std) else pd.Series(0,index=d.index)
+        g["Delta"]=d; g["ZScore"]=z; g["IsAnomaly"]=z<-1.5
         out.append(g)
     if not out: return pd.DataFrame()
     r=pd.concat(out,ignore_index=True)
     return r[r["IsAnomaly"]==True]
 
-def exec_stats(scores,comp,gps,route,schema:Schema) -> dict:
-    latest=sorted(scores["MonthPeriod"].dropna().unique())[-1] if not scores.empty else None
-    d={"latest_month":latest,
-       "avg_compliance":round(comp["CompliancePct"].mean(),1) if not comp.empty else None,
-       "avg_gps_mismatch_pct":round(gps["GPSMismatchPct"].mean(),1) if not gps.empty else None,
-       "high_risk_count":int((scores["RiskCategory"]=="High Risk").sum()) if not scores.empty else 0,
-       "total_srs":scores["SRCode"].nunique() if not scores.empty else 0,
-       "has_route_data":route is not None,
-       "route_source":schema.route_source,
-       "role_cols":schema.role_cols}
-    d["avg_offroute_pct"]=round(route["OffRoutePct"].mean(),1) if route is not None and not route.empty else None
-    return d
-
 # ══════════════════════════════════════════════════════════════════════════════
-# DOCUMENT GENERATION
+# DOCUMENT GENERATION  (concise — keeps memory low)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _p(v,d=1):
+def pf(v,d=1):
     if v is None or (isinstance(v,float) and np.isnan(float(v))): return "N/A"
     return f"{round(float(v),d)}%"
-def _n(v,d=1):
+
+def nf(v,d=1):
     if v is None or (isinstance(v,float) and np.isnan(float(v))): return "N/A"
     return str(round(float(v),d))
 
-def make_documents(planned, actual, scores, comp, route, gps,
-                   miss, dist_sum, month_sum, role_ana,
-                   trend_df, anom_df, stats, schema:Schema) -> list[dict]:
+def make_docs(p, a, scores, comp, route, gps, miss, schema, trend_df, anom_df) -> list[dict]:
     docs = []
 
-    # ── SR documents
+    # --- Executive overview (single short doc)
+    hr  = scores[scores["RiskCategory"]=="High Risk"]["SRCode"].unique().tolist()
+    imp = trend_df[trend_df["Trend"]=="Improving"]["SRCode"].tolist() if not trend_df.empty else []
+    dec = trend_df[trend_df["Trend"]=="Declining"]["SRCode"].tolist() if not trend_df.empty else []
+    lines = [
+        "EXECUTIVE OVERVIEW",
+        f"SRs: {scores['SRCode'].nunique()} | Latest: {scores['MonthPeriod'].max()}",
+        f"Avg Compliance: {pf(comp['CompliancePct'].mean())}",
+        f"Avg GPS Mismatch: {pf(gps['GPSMismatchPct'].mean())}",
+        f"High-Risk SRs ({len(hr)}): {', '.join(hr) or 'None'}",
+        f"Improving: {', '.join(imp) or 'None'}",
+        f"Declining: {', '.join(dec) or 'None'}",
+    ]
+    if route is not None:
+        lines.append(f"Avg Off-Route: {pf(route['OffRoutePct'].mean())}")
+    if anom_df is not None and not anom_df.empty:
+        lines.append("Anomalies: "+", ".join(
+            f"{r['SRCode']} ({r['MonthPeriod']},Δ={nf(r.get('Delta'))})"
+            for _,r in anom_df.head(5).iterrows()))
+    docs.append({"id":"exec","title":"Executive Overview","text":"\n".join(lines)})
+
+    # --- One doc per SR
     for sr in sorted(scores["SRCode"].unique()):
         c=comp[comp["SRCode"]==sr].sort_values("MonthPeriod")
         g=gps[gps["SRCode"]==sr].sort_values("MonthPeriod")
         s=scores[scores["SRCode"]==sr].sort_values("MonthPeriod")
         r=route[route["SRCode"]==sr].sort_values("MonthPeriod") if route is not None else None
         dist=c["DistributorCode"].iloc[0] if not c.empty else "?"
-        months=sorted(s["MonthPeriod"].unique())
-        latest_s=s["BehaviourScore"].iloc[-1] if not s.empty else None
-        latest_r=s["RiskCategory"].iloc[-1] if not s.empty else "?"
-        role_info=""
+        lsc=s["BehaviourScore"].iloc[-1] if not s.empty else None
+        lrk=str(s["RiskCategory"].iloc[-1]) if not s.empty else "?"
+        trd=trend_df[trend_df["SRCode"]==sr]["Trend"].values
+        trd=trd[0] if len(trd) else "?"
+        # role info
+        ri=""
         if schema.role_cols:
-            row=actual[actual["SRCode"]==sr]
+            row=a[a["SRCode"]==sr]
             if not row.empty:
-                parts=[f"{rc.replace('Role_','')}: {row.iloc[0].get(rc,'')}"
-                       for rc in schema.role_cols if pd.notna(row.iloc[0].get(rc,""))]
-                role_info=" | ".join(parts)
-        lines=[f"SR PERFORMANCE SUMMARY","="*22,
-               f"SR: {sr} | Distributor: {dist}"]
-        if role_info: lines.append(f"Hierarchy: {role_info}")
-        lines+=[f"Period: {months[0]} to {months[-1]}" if months else "",
-               f"Behaviour Score: {_n(latest_s)}/100 | Risk: {latest_r}",
-               f"Avg Compliance: {_p(c['CompliancePct'].mean())} | Avg GPS Mismatch: {_p(g['GPSMismatchPct'].mean())}",
-               "","MONTHLY COMPLIANCE"]
-        for _,row in c.iterrows():
-            lines.append(f"  {row['MonthPeriod']}: {_p(row.get('CompliancePct'))} "
-                         f"(planned={int(row.get('PlannedVisits',0))}, "
-                         f"completed={int(row.get('CompletedVisits',0))}, "
-                         f"missed={int(row.get('MissedVisits',0))})")
-        lines+=["","GPS VERIFICATION"]
-        for _,row in g.iterrows():
-            lines.append(f"  {row['MonthPeriod']}: {_p(row.get('GPSMismatchPct'))} mismatch "
-                         f"({int(row.get('GPSMismatches',0))}/{int(row.get('TotalVisits',0))}, "
-                         f"avg dist={_n(row.get('AvgGPSDistance'),0)}m)")
+                ri=" | ".join(f"{rc.replace('Role_','')}: {row.iloc[0].get(rc,'')}"
+                              for rc in schema.role_cols
+                              if pd.notna(row.iloc[0].get(rc,"")))
+        lines=[f"SR {sr} | Distributor:{dist} | Score:{nf(lsc)}/100 | Risk:{lrk} | Trend:{trd}"]
+        if ri: lines.append(f"Hierarchy: {ri}")
+        lines.append(f"Avg Compliance:{pf(c['CompliancePct'].mean())} | Avg GPS Mismatch:{pf(g['GPSMismatchPct'].mean())}")
+        lines.append("Monthly compliance: "+
+            " | ".join(f"{row['MonthPeriod']}:{pf(row.get('CompliancePct'))}"
+                       f"(pl={int(row.get('PlannedVisits',0))},"
+                       f"cp={int(row.get('CompletedVisits',0))},"
+                       f"ms={int(row.get('MissedVisits',0))})"
+                       for _,row in c.iterrows()))
+        lines.append("GPS by month: "+
+            " | ".join(f"{row['MonthPeriod']}:{pf(row.get('GPSMismatchPct'))}"
+                       f"({int(row.get('GPSMismatches',0))}/{int(row.get('TotalVisits',0))},"
+                       f"avg={nf(row.get('AvgDist'),0)}m)"
+                       for _,row in g.iterrows()))
         if r is not None:
-            lines+=["",f"ROUTE ADHERENCE (source:{schema.route_source})"]
-            for _,row in r.iterrows():
-                lines.append(f"  {row['MonthPeriod']}: {_p(row.get('OffRoutePct'))} off-route "
-                             f"({int(row.get('OffRouteVisits',0))}/{int(row.get('TotalVisits',0))})")
-        lines+=["","SCORE HISTORY"]
-        for _,row in s.iterrows():
-            lines.append(f"  {row['MonthPeriod']}: score={_n(row.get('BehaviourScore'))} ({row.get('RiskCategory','')})")
+            lines.append("Route by month: "+
+                " | ".join(f"{row['MonthPeriod']}:{pf(row.get('OffRoutePct'))}"
+                           f"({int(row.get('OffRouteVisits',0))}/{int(row.get('TotalVisits',0))})"
+                           for _,row in r.iterrows()))
         # observations
         obs=[]
         if len(c)>=2:
             drop=c["CompliancePct"].iloc[0]-c["CompliancePct"].iloc[-1]
-            if drop>10: obs.append(f"Compliance fell {drop:.1f}pp — significant decline.")
+            if drop>10: obs.append(f"Compliance fell {drop:.1f}pp — declining trend.")
         if len(g)>=2:
             rise=g["GPSMismatchPct"].iloc[-1]-g["GPSMismatchPct"].iloc[0]
-            if rise>10: obs.append(f"GPS mismatch rose {rise:.1f}pp — possible spoofing, needs investigation.")
-        if not s.empty and str(s["RiskCategory"].iloc[-1])=="High Risk":
-            obs.append("HIGH RISK — immediate manager review recommended.")
-        if obs: lines+=["","OBSERVATIONS"]+[f"  • {o}" for o in obs]
-        docs.append({"id":f"sr_{sr}","title":f"SR {sr} Summary","text":"\n".join(lines)})
+            if rise>10: obs.append(f"GPS mismatch rose {rise:.1f}pp — possible spoofing.")
+        if lrk=="High Risk": obs.append("HIGH RISK — immediate manager review needed.")
+        if obs: lines.append("Observations: "+" | ".join(obs))
+        docs.append({"id":f"sr_{sr}","title":f"SR {sr} Performance","text":"\n".join(lines)})
 
-    # ── Distributor documents
+    # --- One doc per distributor
     for dist in sorted(comp["DistributorCode"].unique()):
         c=comp[comp["DistributorCode"]==dist]
         g=gps[gps["DistributorCode"]==dist]
-        months=sorted(c["MonthPeriod"].unique())
         sr_rank=c.groupby("SRCode")["CompliancePct"].mean().sort_values()
-        lines=[f"DISTRIBUTOR SUMMARY","="*18,
-               f"Distributor: {dist}",
+        months=sorted(c["MonthPeriod"].unique())
+        lines=[f"DISTRIBUTOR {dist}",
                f"SRs: {', '.join(sorted(c['SRCode'].unique()))}",
-               f"Avg Compliance: {_p(c['CompliancePct'].mean())} | Avg GPS Mismatch: {_p(g['GPSMismatchPct'].mean())}",
-               f"Total Planned: {int(c['PlannedVisits'].sum())} | Completed: {int(c['CompletedVisits'].sum())} | Missed: {int(c['MissedVisits'].sum())}",
-               "","SR COMPLIANCE RANKING"]
-        for sr_c,val in sr_rank.items(): lines.append(f"  {sr_c}: {_p(val)}")
-        lines+=["","MONTHLY TREND"]
-        for m in months:
-            mc=c[c["MonthPeriod"]==m]["CompliancePct"].mean()
-            mg=g[g["MonthPeriod"]==m]["GPSMismatchPct"].mean()
-            lines.append(f"  {m}: compliance={_p(mc)} gps-mismatch={_p(mg)}")
-        docs.append({"id":f"dist_{dist}","title":f"Distributor {dist} Summary","text":"\n".join(lines)})
+               f"Avg Compliance:{pf(c['CompliancePct'].mean())} | Avg GPS:{pf(g['GPSMismatchPct'].mean())}",
+               f"Total: planned={int(c['PlannedVisits'].sum())} completed={int(c['CompletedVisits'].sum())} missed={int(c['MissedVisits'].sum())}",
+               "SR ranking: "+", ".join(f"{sr}:{pf(v)}" for sr,v in sr_rank.items()),
+               "Monthly: "+
+               " | ".join(f"{m}: comp={pf(c[c['MonthPeriod']==m]['CompliancePct'].mean())}"
+                          f" gps={pf(g[g['MonthPeriod']==m]['GPSMismatchPct'].mean())}"
+                          for m in months)]
+        docs.append({"id":f"dist_{dist}","title":f"Distributor {dist}","text":"\n".join(lines)})
 
-    # ── Monthly documents
-    months_all=sorted(comp["MonthPeriod"].unique())
-    for i,month in enumerate(months_all):
+    # --- One doc per month
+    for month in sorted(comp["MonthPeriod"].unique()):
         c=comp[comp["MonthPeriod"]==month]
         g=gps[gps["MonthPeriod"]==month]
         s=scores[scores["MonthPeriod"]==month]
         sr_rank=c.groupby("SRCode")["CompliancePct"].mean().sort_values()
-        hr=int((s["RiskCategory"]=="High Risk").sum())
-        prev=""
-        if i>0:
-            pc=comp[comp["MonthPeriod"]==months_all[i-1]]["CompliancePct"].mean()
-            diff=c["CompliancePct"].mean()-pc
-            prev=f"vs {months_all[i-1]}: compliance {'improved' if diff>0 else 'declined'} by {abs(diff):.1f}pp."
-        lines=[f"MONTHLY SUMMARY: {month}","="*20,
-               f"Avg Compliance: {_p(c['CompliancePct'].mean())} | Avg GPS Mismatch: {_p(g['GPSMismatchPct'].mean())}",
-               f"High-Risk SRs: {hr} | Planned: {int(c['PlannedVisits'].sum())} | Completed: {int(c['CompletedVisits'].sum())}"]
-        if prev: lines.append(f"MOM: {prev}")
-        lines+=["","SR RANKING"]
-        for sr_c,val in sr_rank.items():
-            rk=s[s["SRCode"]==sr_c]["RiskCategory"].values
-            lines.append(f"  {sr_c}: {_p(val)}"+(f" [{rk[0]}]" if len(rk) else ""))
-        lines+=[f"","TOP: {', '.join(sr_rank.tail(3).index.tolist())}",
-                f"NEEDS ATTENTION: {', '.join(sr_rank.head(3).index.tolist())}"]
-        docs.append({"id":f"month_{month}","title":f"Monthly Summary {month}","text":"\n".join(lines)})
+        hr=s[s["RiskCategory"]=="High Risk"]["SRCode"].tolist()
+        lines=[f"MONTH {month}",
+               f"Avg Compliance:{pf(c['CompliancePct'].mean())} | Avg GPS:{pf(g['GPSMismatchPct'].mean())}",
+               f"High-Risk SRs: {', '.join(hr) or 'None'}",
+               f"Planned:{int(c['PlannedVisits'].sum())} Completed:{int(c['CompletedVisits'].sum())} Missed:{int(c['MissedVisits'].sum())}",
+               "SR ranking: "+", ".join(f"{sr}:{pf(v)}" for sr,v in sr_rank.items()),
+               f"Top performers: {', '.join(sr_rank.tail(3).index.tolist())}",
+               f"Needs attention: {', '.join(sr_rank.head(3).index.tolist())}"]
+        if route is not None:
+            rt2=route[route["MonthPeriod"]==month]
+            lines.append(f"Avg Off-Route:{pf(rt2['OffRoutePct'].mean())}")
+        docs.append({"id":f"month_{month}","title":f"Month {month}","text":"\n".join(lines)})
 
-    # ── Role documents
-    for rc,df_r in role_ana.items():
-        label=rc.replace("Role_","").replace("_"," ")
-        for _,row in df_r.iterrows():
-            val=str(row.get(rc,""))
+    # --- Role docs
+    for rc in schema.role_cols:
+        if rc not in a.columns: continue
+        lbl=rc.replace("Role_","").replace("_"," ")
+        for val in sorted(a[rc].dropna().astype(str).str.strip().unique()):
             if not val or val.lower() in ("nan","none",""): continue
-            my_srs=actual[actual[rc].astype(str).str.strip()==val]["SRCode"].unique().tolist()
+            my_srs=a[a[rc].astype(str).str.strip()==val]["SRCode"].unique().tolist()
             c2=comp[comp["SRCode"].isin(my_srs)]
             s2=scores[scores["SRCode"].isin(my_srs)]
-            hr=int((s2["RiskCategory"]=="High Risk").sum())
-            lines=[f"{label.upper()} SUMMARY","="*(len(label)+8),
-                   f"{label}: {val}",
+            hr2=s2[s2["RiskCategory"]=="High Risk"]["SRCode"].tolist()
+            lines=[f"{lbl.upper()}: {val}",
                    f"SRs: {', '.join(my_srs)}",
-                   f"Avg Compliance: {_p(row.get('AvgCompliancePct'))} | Avg GPS Mismatch: {_p(row.get('AvgGPSMismatchPct'))}",
-                   f"High-Risk SRs: {hr}/{len(my_srs)}",
-                   f"Planned: {int(c2['PlannedVisits'].sum())} | Completed: {int(c2['CompletedVisits'].sum())}"]
-            if hr>0:
-                hr_list=s2[s2["RiskCategory"]=="High Risk"]["SRCode"].unique().tolist()
-                lines+=["",f"HIGH RISK SRs under {label} {val}: {', '.join(hr_list)} — manager review needed."]
-            docs.append({"id":f"role_{rc}_{val}","title":f"{label} '{val}' Summary","text":"\n".join(lines)})
+                   f"Avg Compliance:{pf(c2['CompliancePct'].mean())} | High-Risk:{len(hr2)}/{len(my_srs)}",
+                   f"Planned:{int(c2['PlannedVisits'].sum())} Completed:{int(c2['CompletedVisits'].sum())}"]
+            if hr2: lines.append(f"High-Risk SRs needing attention: {', '.join(hr2)}")
+            docs.append({"id":f"role_{rc}_{val}","title":f"{lbl} '{val}'",
+                         "text":"\n".join(lines)})
 
-    # ── Store miss document
-    lines=["STORE MISS ANALYSIS","="*18,"Stores repeatedly planned but missed.",""]
-    for _,row in miss.head(20).iterrows():
-        lines.append(f"  Store {row['StoreID']} (Dist:{row['DistributorCode']}): "
-                     f"planned {int(row.get('TimesPlanned',0))}x | "
-                     f"missed {int(row.get('TimesMissed',0))}x | "
-                     f"miss rate {_p(row.get('MissRate'))}")
+    # --- Store miss doc
+    lines=["STORE MISS ANALYSIS — stores planned but frequently missed"]
+    for _,row in miss.head(15).iterrows():
+        lines.append(f"Store {row['StoreID']} (Dist:{row['DistributorCode']}): "
+                     f"planned {int(row.get('TimesPlanned',0))}x "
+                     f"missed {int(row.get('TimesMissed',0))}x "
+                     f"rate {pf(row.get('MissRate'))}")
     docs.append({"id":"store_miss","title":"Store Miss Analysis","text":"\n".join(lines)})
 
-    # ── GPS document
-    a2=add_gps_dist(actual)
-    a2["GPSMismatch"]=a2["GPSDistanceMeters"]>100
-    susp=a2[a2["GPSMismatch"]].sort_values("GPSDistanceMeters",ascending=False)
-    latest_m=gps["MonthPeriod"].max()
+    # --- GPS doc
+    latest_m = gps["MonthPeriod"].max()
     lg=gps[gps["MonthPeriod"]==latest_m].sort_values("GPSMismatchPct",ascending=False)
-    lines=["GPS VERIFICATION INTELLIGENCE","="*28,
-           "","WORST OFFENDERS (latest month)"]
-    for _,row in lg.head(8).iterrows():
-        lines.append(f"  {row['SRCode']}: {_p(row.get('GPSMismatchPct'))} "
-                     f"({int(row.get('GPSMismatches',0))}/{int(row.get('TotalVisits',0))}, avg={_n(row.get('AvgGPSDistance'),0)}m)")
-    lines+=["","TOP OUTLIER VISITS"]
-    for _,row in susp.head(8).iterrows():
-        lines.append(f"  SR={row['SRCode']} Store={row['StoreID']}: dist={_n(row['GPSDistanceMeters'],0)}m")
-    docs.append({"id":"gps_intel","title":"GPS Verification Intelligence","text":"\n".join(lines)})
-
-    # ── Executive overview
-    hr=scores[scores["RiskCategory"]=="High Risk"]["SRCode"].unique().tolist()
-    mr=scores[scores["RiskCategory"]=="Medium Risk"]["SRCode"].unique().tolist()
-    imp=trend_df[trend_df["Trend"]=="Improving"]["SRCode"].tolist() if trend_df is not None and not trend_df.empty else []
-    dec=trend_df[trend_df["Trend"]=="Declining"]["SRCode"].tolist() if trend_df is not None and not trend_df.empty else []
-    lines=["EXECUTIVE OVERVIEW","="*17,
-           f"SRs: {stats.get('total_srs','?')} | Latest: {stats.get('latest_month','?')}",
-           f"Avg Compliance: {stats.get('avg_compliance','N/A')}% | Avg GPS Mismatch: {stats.get('avg_gps_mismatch_pct','N/A')}%",
-           f"High-Risk SRs: {stats.get('high_risk_count',0)}",
-           "","RISK BREAKDOWN",
-           f"  HIGH RISK ({len(hr)}): {', '.join(hr) or 'None'}",
-           f"  MEDIUM RISK ({len(mr)}): {', '.join(mr) or 'None'}",
-           "","TRENDS",
-           f"  Improving: {', '.join(imp) or 'None'}",
-           f"  Declining: {', '.join(dec) or 'None'}"]
-    if anom_df is not None and not anom_df.empty:
-        lines+=["","ANOMALIES"]
-        for _,row in anom_df.head(5).iterrows():
-            lines.append(f"  {row['SRCode']} {row['MonthPeriod']}: score={_n(row.get('BehaviourScore'))} drop={_n(row.get('Delta'))}")
-    lines+=["","DISTRIBUTOR PERFORMANCE"]
-    for _,row in dist_sum.iterrows():
-        lines.append(f"  {row['DistributorCode']}: compliance={_p(row.get('AvgCompliancePct'))} gps={_p(row.get('AvgGPSMismatchPct'))}")
-    docs.append({"id":"executive","title":"Executive Overview","text":"\n".join(lines)})
+    lines=["GPS VERIFICATION INTELLIGENCE",
+           f"Latest month: {latest_m}",
+           "Worst GPS offenders: "+
+           ", ".join(f"{row['SRCode']}:{pf(row.get('GPSMismatchPct'))}"
+                     f"({int(row.get('GPSMismatches',0))}/{int(row.get('TotalVisits',0))},"
+                     f"avg={nf(row.get('AvgDist'),0)}m)"
+                     for _,row in lg.head(8).iterrows())]
+    docs.append({"id":"gps","title":"GPS Intelligence","text":"\n".join(lines)})
 
     return docs
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RAG PIPELINE — numpy vector store, zero heavy dependencies
+# VECTOR STORE  (pure numpy — no chromadb)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class KeywordEmbedder:
-    DIM = 384
-    def __init__(self):
-        self._cache: dict[str,np.ndarray] = {}
-    def _vec(self,w):
-        if w not in self._cache:
+class KWEmbed:
+    """Hash-based keyword embedder. Zero dependencies beyond numpy."""
+    DIM = 256  # smaller = less RAM
+    def __init__(self): self._c:dict={}
+    def _w(self,w):
+        if w not in self._c:
             h=hashlib.md5(w.encode()).digest()
             seed=int.from_bytes(h[:4],"little")
             v=np.random.RandomState(seed).randn(self.DIM).astype(np.float32)
-            n=np.linalg.norm(v); self._cache[w]=v/n if n>0 else v
-        return self._cache[w]
+            n=np.linalg.norm(v); self._c[w]=v/n if n>0 else v
+        return self._c[w]
     def embed(self,text:str)->np.ndarray:
-        words=text.lower().split()
-        if not words: return np.zeros(self.DIM,dtype=np.float32)
-        v=np.stack([self._vec(w) for w in words]).mean(axis=0)
+        ws=text.lower().split()
+        if not ws: return np.zeros(self.DIM,dtype=np.float32)
+        v=np.stack([self._w(w) for w in ws[:200]]).mean(0)  # cap at 200 words
         n=np.linalg.norm(v); return v/n if n>0 else v
-    def embed_batch(self,texts:list[str])->np.ndarray:
-        return np.stack([self.embed(t) for t in texts])
 
-def _chunk(text:str,size=500,overlap=60)->list[str]:
-    if not text.strip(): return []
-    if len(text)<=size: return [text.strip()]
-    chunks,start=[],0
-    while start<len(text):
-        end=min(start+size,len(text))
-        if end<len(text):
-            for sep in ["\n\n","\n",". "," "]:
+class VecStore:
+    def __init__(self):
+        self._E:Optional[np.ndarray]=None
+        self._T:list=[]; self._M:list=[]
+    def clear(self): self._E=None; self._T.clear(); self._M.clear(); gc.collect()
+    def add(self,texts,embs,metas):
+        e=embs.astype(np.float32)
+        self._E=e if self._E is None else np.vstack([self._E,e])
+        self._T.extend(texts); self._M.extend(metas)
+    def query(self,qv,k):
+        if self._E is None: return []
+        q=qv.astype(np.float32); n=np.linalg.norm(q)
+        if n>0: q/=n
+        sims=self._E@q; k=min(k,len(self._T))
+        idx=np.argpartition(sims,-k)[-k:]
+        idx=idx[np.argsort(sims[idx])[::-1]]
+        return [(self._T[i],self._M[i],float(sims[i])) for i in idx]
+    @property
+    def size(self): return len(self._T)
+
+def chunk_text(text:str,sz=400,ov=50)->list:
+    if not text or not text.strip(): return []
+    if len(text)<=sz: return [text.strip()]
+    out,start=[],0; n=len(text)
+    while start<n:
+        end=min(start+sz,n)
+        if end<n:
+            for sep in ["\n",". "," "]:
                 i=text.rfind(sep,start,end)
                 if i>start: end=i+len(sep); break
         c=text[start:end].strip()
-        if c: chunks.append(c)
-        start=end-overlap
-        if start>=len(text): break
-    return chunks
+        if c: out.append(c)
+        start=end-ov
+        if start>=n: break
+    return out
 
-@st.cache_resource(show_spinner="Preparing embedding engine…")
-def _get_embedder():
-    api_key=_get_api_key()
-    if api_key:
-        try:
-            from google import genai
-            client=genai.Client(api_key=api_key)
-            client.models.embed_content(model="text-embedding-004",content="test")
-            class GeminiEmb:
-                def __init__(self,c): self._c=c
-                def embed(self,text):
-                    try:
-                        r=self._c.models.embed_content(model="text-embedding-004",content=text[:2000])
-                        return np.array(r.embeddings[0].values,dtype=np.float32)
-                    except: return KeywordEmbedder().embed(text)
-                def embed_batch(self,texts):
-                    out=[]
-                    for t in texts:
-                        out.append(self.embed(t)); time.sleep(0.04)
-                    return np.stack(out)
-            return GeminiEmb(client)
-        except Exception:
-            pass
-    return KeywordEmbedder()
-
-class VectorStore:
-    def __init__(self): self._embs=None; self._texts=[]; self._meta=[]
-    def clear(self): self._embs=None; self._texts.clear(); self._meta.clear(); gc.collect()
-    def add(self,texts,embs,metas):
-        self._embs=embs.astype(np.float32) if self._embs is None else np.vstack([self._embs,embs.astype(np.float32)])
-        self._texts.extend(texts); self._meta.extend(metas)
-    def query(self,qv,k):
-        if self._embs is None: return []
-        q=qv.astype(np.float32); n=np.linalg.norm(q)
-        if n>0: q=q/n
-        sims=self._embs@q; k=min(k,len(self._texts))
-        idxs=np.argpartition(sims,-k)[-k:]
-        idxs=idxs[np.argsort(sims[idxs])[::-1]]
-        return [(self._texts[i],self._meta[i],float(sims[i])) for i in idxs]
-    @property
-    def size(self): return len(self._texts)
-
-def build_rag(docs:list[dict]) -> VectorStore:
-    emb=_get_embedder()
-    store=VectorStore()
-    BATCH=15
-    buf_t,buf_m=[],[]
-    def flush():
-        if not buf_t: return
-        e=emb.embed_batch(buf_t)
-        store.add(buf_t[:],e,buf_m[:])
-        buf_t.clear(); buf_m.clear(); gc.collect()
+def build_store(docs:list, emb:KWEmbed) -> VecStore:
+    store=VecStore()
     for doc in docs:
-        for i,chunk in enumerate(_chunk(doc["text"])):
-            buf_t.append(chunk)
-            buf_m.append({"doc_id":doc["id"],"doc_title":doc["title"]})
-            if len(buf_t)>=BATCH: flush()
-    flush()
+        chunks=chunk_text(doc["text"])
+        if not chunks: continue
+        embs=np.stack([emb.embed(c) for c in chunks])
+        metas=[{"id":doc["id"],"title":doc["title"]} for _ in chunks]
+        store.add(chunks,embs,metas)
+        gc.collect()
     return store
 
-def retrieve(store:VectorStore,query:str,k=5)->str:
-    if store.size==0: return "(No knowledge base built yet.)"
-    emb=_get_embedder()
-    qv=emb.embed(query)
-    results=store.query(qv,k)
-    if not results: return "(No relevant context found.)"
+def retrieve(store:VecStore, emb:KWEmbed, query:str, k=5)->str:
+    if store.size==0: return "(No knowledge base.)"
+    results=store.query(emb.embed(query),k)
+    if not results: return "(No results.)"
     return "\n\n---\n\n".join(
-        f"[Source: {m.get('doc_title','?')} | score: {s:.2f}]\n{t}"
+        f"[{m.get('title','?')} | score:{s:.2f}]\n{t}"
         for t,m,s in results)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GEMINI CHATBOT
 # ══════════════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """You are an expert AI Sales Performance Analyst. You answer questions
-by reasoning over retrieved business intelligence documents from a field-sales dataset.
-Always cite specific SR codes, distributor codes, months, and numbers from the context.
-Explain root causes, not just numbers. Prioritise by business impact.
-End every answer with 1-3 concrete, actionable recommendations.
-If something is not in the retrieved context, say so — never invent data."""
+SYS = """You are an expert AI Sales Performance Analyst.
+Answer questions using ONLY the retrieved context provided before each question.
+Always cite specific SR codes, months, and numbers from the context.
+Explain root causes, prioritise by business impact, end with 1-3 recommendations.
+If data is not in the context, say so — never invent information."""
 
-def _retry(fn,retries=3):
-    for attempt in range(retries+1):
+def _retry(fn, n=3):
+    for i in range(n+1):
         try: return fn()
         except Exception as e:
             msg=str(e)
-            if ("429" in msg or "quota" in msg.lower()) and attempt<retries:
+            if ("429" in msg or "quota" in msg.lower()) and i<n:
                 m=re.search(r"seconds:\s*(\d+)",msg)
-                time.sleep(int(m.group(1))+3 if m else 30*(2**attempt))
+                time.sleep(int(m.group(1))+2 if m else 30*(2**i))
             else: raise
 
-class GeminiChat:
-    FALLBACK=["gemini-2.5-flash","gemini-2.0-flash","gemini-2.0-flash-lite","gemini-1.5-flash-latest"]
-    def __init__(self,store:VectorStore,stats:dict):
-        key=_get_api_key()
-        if not key: raise RuntimeError("No Gemini API key configured.")
+class Chat:
+    CHAIN=["gemini-2.5-flash","gemini-2.0-flash","gemini-2.0-flash-lite","gemini-1.5-flash-latest"]
+    def __init__(self,store,emb,schema):
+        key=get_key()
+        if not key: raise RuntimeError("No Gemini API key found.")
         from google import genai
         from google.genai import types
-        self._genai=genai; self._types=types
-        self._client=genai.Client(api_key=key)
-        self._store=store; self._chat=None
-        route_note=("" if stats.get("has_route_data")
-                    else "NOTE: No VisitType column — route data derived from store matching.")
-        role_note=(f"Role hierarchy detected: {', '.join(stats.get('role_cols',[]))}."
-                   if stats.get("role_cols") else "")
-        self._sys=SYSTEM_PROMPT+("\n\n"+route_note if route_note else "")+("\n"+role_note if role_note else "")
-        self.model=GEMINI_MODEL
-
+        self._cl=genai.Client(api_key=key)
+        self._ty=types; self._chat=None
+        self._store=store; self._emb=emb
+        note=("" if "VisitType" in (schema.route_source or "")
+              else f"Route data derived from {schema.route_source}. ")
+        role_note=(f"Role hierarchy: {', '.join(schema.role_cols)}. "
+                   if schema.role_cols else "")
+        self._sys=SYS+"\n\n"+note+role_note
+        self.model=""
     def start(self):
-        chain=[self.model]+[m for m in self.FALLBACK if m!=self.model]
+        model=get_model()
+        chain=[model]+[m for m in self.CHAIN if m!=model]
         for m in chain:
             try:
-                self._chat=self._client.chats.create(model=m,config=self._types.GenerateContentConfig(
-                    system_instruction=self._sys,max_output_tokens=2048,temperature=0.3))
+                self._chat=self._cl.chats.create(
+                    model=m,
+                    config=self._ty.GenerateContentConfig(
+                        system_instruction=self._sys,
+                        max_output_tokens=2048, temperature=0.3))
                 self.model=m; return
             except Exception as e:
                 if "404" in str(e) or "not found" in str(e).lower(): continue
                 raise
-        raise RuntimeError("No working Gemini model found.")
-
-    def ask(self,question:str)->str:
-        if self._chat is None: raise RuntimeError("Call start() first.")
-        ctx=retrieve(self._store,question)
-        prompt=(f"RETRIEVED CONTEXT\n{'='*16}\n{ctx}\n\n{'='*16}\nQUESTION: {question}\n\n"
-                "Answer based on the retrieved context only.")
+        raise RuntimeError("No Gemini model available.")
+    def ask(self,q:str)->str:
+        if not self._chat: raise RuntimeError("Not started.")
+        ctx=retrieve(self._store,self._emb,q)
+        prompt=f"CONTEXT\n{'='*7}\n{ctx}\n\n{'='*7}\nQUESTION: {q}\n\nAnswer from context only."
         return _retry(lambda:self._chat.send_message(prompt)).text
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STREAMLIT APP
+# SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="Sales Visit Intelligence",layout="wide",
-                   page_icon="🤖",initial_sidebar_state="expanded")
-
-st.markdown("""
-<style>
-[data-testid="stAppViewContainer"]{background:#f7f8fa}
-[data-testid="stSidebar"]{background:#fff;border-right:1px solid #e8eaed}
-.kpi-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
-.kpi-card{background:#fff;border-radius:10px;padding:14px 18px;flex:1;min-width:130px;
-          box-shadow:0 1px 4px rgba(0,0,0,.07);border-left:4px solid #4f8ef7}
-.kpi-card.red{border-left-color:#e53935}.kpi-card.amber{border-left-color:#fb8c00}
-.kpi-card.green{border-left-color:#43a047}
-.kpi-label{font-size:11px;color:#888;font-weight:700;text-transform:uppercase;letter-spacing:.05em}
-.kpi-value{font-size:24px;font-weight:800;color:#1a1a2e;line-height:1.2}
-.kpi-sub{font-size:11px;color:#bbb;margin-top:2px}
-.sr-row{display:flex;justify-content:space-between;align-items:center;
-        padding:6px 0;border-bottom:1px solid #f0f0f0;font-size:13px}
-.sr-row:last-child{border-bottom:none}
-.rag-badge{display:inline-block;background:#e8f5e9;color:#2e7d32;
-           border-radius:20px;padding:3px 12px;font-size:12px;font-weight:700}
-</style>""",unsafe_allow_html=True)
-
-# session state
-for k,v in [("data",None),("store",None),("chat",None),("history",[]),("active_model","")]:
-    if k not in st.session_state: st.session_state[k]=v
-
-# ── Sidebar
 with st.sidebar:
     st.markdown("## 🤖 Sales Visit Intelligence")
-    st.caption("RAG-powered AI analyst")
+    st.caption("RAG-powered AI analyst — Streamlit Cloud Edition")
     st.divider()
-    planned_f=st.file_uploader("Planned Visits (csv/xlsx)",type=["csv","xlsx","xls"])
-    actual_f =st.file_uploader("Actual Visits (csv/xlsx)", type=["csv","xlsx","xls"])
-    gps_thresh=st.slider("GPS threshold (m)",20,1000,100,10)
-    go=st.button("Analyse Data",type="primary",use_container_width=True)
+    pf_up=st.file_uploader("Planned Visits (csv/xlsx)", type=["csv","xlsx","xls"])
+    af_up=st.file_uploader("Actual Visits (csv/xlsx)",  type=["csv","xlsx","xls"])
+    gps_t=st.slider("GPS threshold (m)",20,1000,100,10)
+    go   =st.button("Analyse Data", type="primary", use_container_width=True)
     st.divider()
     if st.session_state.store:
-        st.markdown(f'<div class="rag-badge">✅ {st.session_state.store.size} chunks indexed</div>',
-                    unsafe_allow_html=True)
-    api_ok=bool(_get_api_key())
-    if api_ok:
-        st.success(f"Gemini ✓ {st.session_state.active_model}",icon="✅")
-    else:
-        st.warning("Set GEMINI_API_KEY in Streamlit secrets")
-    if st.session_state.data:
-        if st.button("🔄 Reset",use_container_width=True):
-            for k in ["data","store","chat","active_model"]:
-                st.session_state[k]=None
-            st.session_state.history=[]
+        st.success(f"✅ {st.session_state.store.size} chunks indexed")
+    api_ok=bool(get_key())
+    st.success(f"Gemini ✓ {st.session_state.model_used}" if api_ok and st.session_state.model_used
+               else ("Gemini key detected ✓" if api_ok else "⚠️ Add GEMINI_API_KEY to secrets"))
+    if st.session_state.result:
+        if st.button("🔄 Reset", use_container_width=True):
+            for k in ["result","store","chat","history","model_used"]:
+                st.session_state[k]=[] if k=="history" else None
             st.rerun()
 
-# ── Process
+# ══════════════════════════════════════════════════════════════════════════════
+# PROCESSING  — every step wrapped in try/except, shows real errors
+# ══════════════════════════════════════════════════════════════════════════════
+
 if go:
-    if not planned_f or not actual_f:
-        st.error("Upload both files first.")
-    else:
-        try:
-            p_raw=read_file(planned_f.getvalue(),planned_f.name)
-            a_raw=read_file(actual_f.getvalue(),actual_f.name)
-        except Exception as e:
-            st.error(f"Cannot read files: {e}"); st.stop()
-        m1=validate(p_raw,PLANNED_REQUIRED)
-        m2=validate(a_raw,ACTUAL_REQUIRED)
-        if m1: st.error(f"Planned Visits missing: {m1}"); st.stop()
-        if m2: st.error(f"Actual Visits missing: {m2}"); st.stop()
+    if not pf_up or not af_up:
+        st.error("Please upload both files first."); st.stop()
 
+    # --- load files
+    try:
+        p_raw=load_file(pf_up.getvalue(), pf_up.name)
+        a_raw=load_file(af_up.getvalue(), af_up.name)
+    except Exception:
+        st.error(f"Could not read uploaded files:\n\n```\n{traceback.format_exc()}\n```"); st.stop()
+
+    m1=missing_cols(p_raw, PLAN_COLS)
+    m2=missing_cols(a_raw, ACTUAL_COLS)
+    if m1: st.error(f"Planned Visits missing columns: {m1}"); st.stop()
+    if m2: st.error(f"Actual Visits missing columns: {m2}");  st.stop()
+
+    # --- analytics
+    try:
         with st.spinner("Step 1/3 — Computing analytics…"):
-            p,a=coerce(p_raw.copy(),a_raw.copy())
-            schema=detect_schema(a_raw)
-            comp  =compliance_table(p,a)
-            rt    =route_table(p,a,schema)
-            gps   =gps_table(a,float(gps_thresh))
-            miss  =store_miss_table(p,a)
-            scores=behaviour_scores(comp,rt,gps)
-            trend_df=trend_direction(scores)
-            anom_df =anomalies(scores)
-            month_s =monthly_summary(comp,rt,gps)
-            dist_s  =distributor_summary(comp,rt,gps)
-            role_a  =role_analytics(a,comp,gps,schema)
-            stats   =exec_stats(scores,comp,gps,rt,schema)
+            p,a  = prep(p_raw.copy(), a_raw.copy())
+            schema = detect(a_raw)
+            comp   = calc_compliance(p,a)
+            route  = calc_route(p,a,schema)
+            gps    = calc_gps(a,float(gps_t))
+            miss   = calc_miss(p,a)
+            scores = calc_scores(comp,route,gps)
+            tdf    = calc_trend(scores)
+            adf    = calc_anomalies(scores)
+    except Exception:
+        st.error(f"Error during analytics:\n\n```\n{traceback.format_exc()}\n```"); st.stop()
 
+    # --- documents
+    try:
         with st.spinner("Step 2/3 — Generating knowledge documents…"):
-            docs=make_documents(p,a,scores,comp,rt,gps,miss,dist_s,
-                                month_s,role_a,trend_df,anom_df,stats,schema)
+            docs=make_docs(p,a,scores,comp,route,gps,miss,schema,tdf,adf)
+    except Exception:
+        st.error(f"Error generating documents:\n\n```\n{traceback.format_exc()}\n```"); st.stop()
 
-        with st.spinner(f"Step 3/3 — Building vector index from {len(docs)} documents…"):
-            store=build_rag(docs)
+    # --- RAG index
+    try:
+        with st.spinner(f"Step 3/3 — Indexing {len(docs)} documents…"):
+            emb=KWEmbed()
+            store=build_store(docs,emb)
+    except Exception:
+        st.error(f"Error building index:\n\n```\n{traceback.format_exc()}\n```"); st.stop()
 
-        st.session_state.data={"scores":scores,"comp":comp,"route":rt,"gps":gps,
-            "miss":miss,"month_s":month_s,"schema":schema,"stats":stats,
-            "trend_df":trend_df,"anom_df":anom_df,"gps_thresh":gps_thresh,"actual":a,
-            "role_a":role_a}
-        st.session_state.store=store
-        st.session_state.chat=None
-        st.session_state.history=[]
-        st.session_state.active_model=""
-        st.success(f"✅ Ready — {len(docs)} documents · {store.size} chunks indexed")
-        st.rerun()
+    st.session_state.result={"scores":scores,"comp":comp,"route":route,"gps":gps,
+        "miss":miss,"schema":schema,"tdf":tdf,"adf":adf,"gps_t":gps_t,"actual":a}
+    st.session_state.store=store
+    st.session_state.emb  =emb
+    st.session_state.chat =None
+    st.session_state.history=[]
+    st.session_state.model_used=""
+    st.success(f"✅ {len(docs)} documents · {store.size} chunks ready"); st.rerun()
 
-# ── Landing
-if st.session_state.data is None:
+# ══════════════════════════════════════════════════════════════════════════════
+# LANDING
+# ══════════════════════════════════════════════════════════════════════════════
+
+if not st.session_state.result:
     st.markdown("""
     <div style='text-align:center;padding:90px 20px'>
       <div style='font-size:72px'>🤖</div>
       <h2 style='color:#1a1a2e'>AI Sales Performance Analyst</h2>
       <p style='color:#666;max-width:520px;margin:0 auto;font-size:15px;line-height:1.6'>
         Upload your <strong>Planned Visits</strong> and <strong>Actual Visits</strong>
-        files, then click <strong>Analyse Data</strong>.<br><br>
-        The system computes analytics, generates AI knowledge documents,
-        and builds a semantic search index — all in your browser.
+        files, then click <strong>Analyse Data</strong>.
       </p>
-    </div>""",unsafe_allow_html=True)
-    st.stop()
+    </div>""", unsafe_allow_html=True); st.stop()
 
-# ── Unpack
-d=st.session_state.data
-scores=d["scores"]; comp=d["comp"]; gps=d["gps"]; route=d["route"]
-miss=d["miss"]; month_s=d["month_s"]; schema=d["schema"]; stats=d["stats"]
-trend_df=d["trend_df"]; anom_df=d["anom_df"]; store=st.session_state.store
-gps_thresh=d["gps_thresh"]; role_a=d["role_a"]
+# ══════════════════════════════════════════════════════════════════════════════
+# INIT CHAT
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Init chat
-if api_ok and st.session_state.chat is None and store:
+d=st.session_state.result
+if api_ok and not st.session_state.chat and st.session_state.store:
     try:
-        chat=GeminiChat(store,stats)
+        chat=Chat(st.session_state.store, st.session_state.emb, d["schema"])
         chat.start()
         st.session_state.chat=chat
-        st.session_state.active_model=chat.model
-    except Exception as e:
-        err=str(e)
-        if "404" in err or "not found" in err.lower():
-            st.error("Gemini model not found. Check GEMINI_MODEL in secrets.")
-        elif "429" in err or "quota" in err.lower():
-            st.error("Quota exceeded. Wait or enable billing at aistudio.google.com")
-        else:
-            st.error(f"Could not start AI analyst: {e}")
+        st.session_state.model_used=chat.model
+    except Exception:
+        st.warning(f"AI analyst error:\n\n```\n{traceback.format_exc()}\n```")
 
-# ── KPI strip
-def _kpi(label,value,sub="",cls=""):
+# ══════════════════════════════════════════════════════════════════════════════
+# KPI STRIP
+# ══════════════════════════════════════════════════════════════════════════════
+
+scores=d["scores"]; comp=d["comp"]; gps=d["gps"]
+route=d["route"]; miss=d["miss"]; schema=d["schema"]
+tdf=d["tdf"]; adf=d["adf"]
+
+def kpi(label,val,sub="",cls=""):
     return (f'<div class="kpi-card {cls}"><div class="kpi-label">{label}</div>'
-            f'<div class="kpi-value">{value}</div><div class="kpi-sub">{sub}</div></div>')
-def _pp(v,d=1):
-    return f"{round(float(v),d)}%" if v is not None and not(isinstance(v,float)and np.isnan(v)) else "—"
+            f'<div class="kpi-value">{val}</div><div class="kpi-sub">{sub}</div></div>')
+def pp(v):
+    return f"{round(float(v),1)}%" if v is not None and not(isinstance(v,float)and np.isnan(v)) else "—"
 
-avg_c=stats.get("avg_compliance"); avg_gp=stats.get("avg_gps_mismatch_pct")
-hr=stats.get("high_risk_count",0); total=stats.get("total_srs",0)
-n_dec=int((trend_df["Trend"]=="Declining").sum()) if trend_df is not None else 0
-n_imp=int((trend_df["Trend"]=="Improving").sum()) if trend_df is not None else 0
+ac=comp["CompliancePct"].mean(); ag=gps["GPSMismatchPct"].mean()
+hr=int((scores["RiskCategory"]=="High Risk").sum())
+tot=scores["SRCode"].nunique()
+nd=int((tdf["Trend"]=="Declining").sum()) if not tdf.empty else 0
+ni=int((tdf["Trend"]=="Improving").sum()) if not tdf.empty else 0
 
 cards=[
-    _kpi("Visit Compliance",_pp(avg_c),"planned→completed",
-         "green" if avg_c and avg_c>=80 else "amber" if avg_c and avg_c>=60 else "red"),
-    _kpi("GPS Mismatches",_pp(avg_gp),f">{gps_thresh}m away",
-         "red" if avg_gp and avg_gp>=20 else "amber" if avg_gp and avg_gp>=10 else "green"),
-    _kpi("High-Risk SRs",str(hr),f"of {total}","red" if hr else "green"),
-    _kpi("Declining SRs",str(n_dec),"month-over-month","red" if n_dec else "green"),
-    _kpi("Improving SRs",str(n_imp),"month-over-month","green" if n_imp else ""),
-    _kpi("Latest Period",stats.get("latest_month",""),"in dataset"),
+    kpi("Compliance",pp(ac),"planned→completed",
+        "green" if ac>=80 else "amber" if ac>=60 else "red"),
+    kpi("GPS Mismatches",pp(ag),f">{d['gps_t']}m",
+        "red" if ag>=20 else "amber" if ag>=10 else "green"),
+    kpi("High-Risk SRs",str(hr),f"of {tot}","red" if hr else "green"),
+    kpi("Declining",str(nd),"SRs","red" if nd else "green"),
+    kpi("Improving",str(ni),"SRs","green" if ni else ""),
+    kpi("Latest",scores["MonthPeriod"].max(),"period"),
 ]
-if stats.get("avg_offroute_pct") is not None:
-    avg_or=stats["avg_offroute_pct"]
-    cards.insert(1,_kpi("Off-Route Rate",_pp(avg_or),f"source:{schema.route_source}",
-                         "red" if avg_or>=30 else "amber" if avg_or>=15 else "green"))
+if route is not None:
+    ao=route["OffRoutePct"].mean()
+    cards.insert(1,kpi("Off-Route",pp(ao),schema.route_source,
+                       "red" if ao>=30 else "amber" if ao>=15 else "green"))
+
 st.markdown(f'<div class="kpi-row">{"".join(cards)}</div>',unsafe_allow_html=True)
 st.divider()
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN LAYOUT
+# ══════════════════════════════════════════════════════════════════════════════
+
 left,right=st.columns([1,2.2],gap="large")
 
-# ── Left panel
 with left:
     with st.expander("📋 Seller Risk Snapshot",expanded=True):
         lm=scores["MonthPeriod"].max()
-        snap=(scores[scores["MonthPeriod"]==lm].sort_values("BehaviourScore")
-              .merge(trend_df[["SRCode","Trend"]],on="SRCode",how="left"))
-        RISK={"High Risk":"🔴","Medium Risk":"🟡","Low Risk":"🟢"}
-        TREND={"Improving":"📈","Declining":"📉","Stable":"➡️"}
+        snap=(scores[scores["MonthPeriod"]==lm]
+              .sort_values("BehaviourScore")
+              .merge(tdf[["SRCode","Trend"]],on="SRCode",how="left"))
+        RI={"High Risk":"🔴","Medium Risk":"🟡","Low Risk":"🟢"}
+        TR={"Improving":"📈","Declining":"📉","Stable":"➡️"}
         for _,r in snap.iterrows():
-            ri=RISK.get(str(r["RiskCategory"]),"⚪"); ti=TREND.get(str(r.get("Trend","")),"❓")
+            ri=RI.get(str(r["RiskCategory"]),"⚪"); ti=TR.get(str(r.get("Trend","")),"❓")
             sc=f"{r['BehaviourScore']:.0f}" if pd.notna(r["BehaviourScore"]) else "—"
             st.markdown(f'<div class="sr-row"><span>{ri} <strong>{r["SRCode"]}</strong></span>'
                         f'<span style="color:#888">Score <strong style="color:#1a1a2e">{sc}</strong> {ti}</span></div>',
                         unsafe_allow_html=True)
 
     for rc in schema.role_cols:
-        if rc in role_a:
+        if rc in d["actual"].columns:
             lbl=rc.replace("Role_","").replace("_"," ")
-            with st.expander(f"👥 {lbl} Performance",expanded=False):
-                st.dataframe(role_a[rc].rename(columns={rc:lbl,
-                    "AvgCompliancePct":"Compliance %","AvgGPSMismatchPct":"GPS Mismatch %",
-                    "SRCount":"SRs"}),hide_index=True,use_container_width=True)
+            with st.expander(f"👥 {lbl}",expanded=False):
+                role_map=d["actual"][["SRCode",rc]].drop_duplicates("SRCode")
+                cg=comp.merge(role_map,on="SRCode",how="left")
+                gg=gps.merge(role_map,on="SRCode",how="left")
+                c2=cg.groupby(rc,as_index=False).agg(
+                    AvgComp=("CompliancePct","mean"),SRs=("SRCode","nunique"))
+                g2=gg.groupby(rc,as_index=False).agg(AvgGPS=("GPSMismatchPct","mean"))
+                st.dataframe(c2.merge(g2,on=rc).rename(columns={
+                    rc:lbl,"AvgComp":"Compliance %","AvgGPS":"GPS Mismatch %"}),
+                    hide_index=True,use_container_width=True)
 
     with st.expander("📅 Monthly Trend",expanded=False):
-        if not month_s.empty:
-            fig=go.Figure()
-            fig.add_trace(go.Scatter(x=month_s["MonthPeriod"],y=month_s["AvgCompliancePct"],
-                name="Compliance %",mode="lines+markers",line=dict(color="#4f8ef7",width=2)))
-            fig.add_trace(go.Scatter(x=month_s["MonthPeriod"],y=month_s["AvgGPSMismatchPct"],
-                name="GPS Mismatch %",mode="lines+markers",line=dict(color="#e53935",width=2)))
-            if "AvgOffRoutePct" in month_s.columns:
-                fig.add_trace(go.Scatter(x=month_s["MonthPeriod"],y=month_s["AvgOffRoutePct"],
-                    name="Off-Route %",mode="lines+markers",line=dict(color="#fb8c00",width=2)))
-            fig.update_layout(height=210,margin=dict(l=0,r=0,t=4,b=0),
-                legend=dict(orientation="h",y=-0.45,font=dict(size=10)),
-                plot_bgcolor="#fff",paper_bgcolor="#fff")
-            st.plotly_chart(fig,use_container_width=True)
+        ms=d["comp"].groupby("MonthPeriod",as_index=False).agg(
+            Comp=("CompliancePct","mean"))
+        gs=d["gps"].groupby("MonthPeriod",as_index=False).agg(
+            GPS=("GPSMismatchPct","mean"))
+        ms2=ms.merge(gs,on="MonthPeriod")
+        fig=go.Figure()
+        fig.add_trace(go.Scatter(x=ms2["MonthPeriod"],y=ms2["Comp"],
+            name="Compliance %",mode="lines+markers",line=dict(color="#4f8ef7",width=2)))
+        fig.add_trace(go.Scatter(x=ms2["MonthPeriod"],y=ms2["GPS"],
+            name="GPS Mismatch %",mode="lines+markers",line=dict(color="#e53935",width=2)))
+        if route is not None:
+            rs=route.groupby("MonthPeriod",as_index=False).agg(OR=("OffRoutePct","mean"))
+            ms2=ms2.merge(rs,on="MonthPeriod",how="left")
+            fig.add_trace(go.Scatter(x=ms2["MonthPeriod"],y=ms2["OR"],
+                name="Off-Route %",mode="lines+markers",line=dict(color="#fb8c00",width=2)))
+        fig.update_layout(height=210,margin=dict(l=0,r=0,t=4,b=0),
+            legend=dict(orientation="h",y=-0.45,font=dict(size=10)),
+            plot_bgcolor="#fff",paper_bgcolor="#fff")
+        st.plotly_chart(fig,use_container_width=True)
 
     with st.expander("🏪 Top Missed Stores",expanded=False):
         m2=miss.head(8)[["StoreID","TimesPlanned","TimesMissed","MissRate"]].copy()
         m2["MissRate"]=m2["MissRate"].map(lambda x:f"{x:.0f}%" if pd.notna(x) else "—")
         st.dataframe(m2,hide_index=True,use_container_width=True)
 
-    if anom_df is not None and not anom_df.empty:
-        with st.expander(f"⚠️ Anomalies ({len(anom_df)})",expanded=False):
-            st.dataframe(anom_df[["SRCode","MonthPeriod","BehaviourScore","Delta"]]
+    if adf is not None and not adf.empty:
+        with st.expander(f"⚠️ Anomalies ({len(adf)})",expanded=False):
+            st.dataframe(adf[["SRCode","MonthPeriod","BehaviourScore","Delta"]]
                 .rename(columns={"Delta":"Score Drop"}),hide_index=True,use_container_width=True)
 
-# ── Chatbot
 with right:
     st.markdown('<div style="font-size:11px;font-weight:700;color:#888;'
                 'text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">'
-                '💬 AI Sales Performance Analyst (RAG)</div>',unsafe_allow_html=True)
+                '💬 AI Sales Analyst (RAG-powered)</div>',unsafe_allow_html=True)
+
     if not api_ok:
-        st.info("Set GEMINI_API_KEY in Streamlit Cloud secrets to activate the AI analyst.")
-        st.stop()
+        st.info("Add GEMINI_API_KEY to Streamlit Cloud secrets to activate the AI analyst."); st.stop()
     if not st.session_state.chat:
-        st.warning("AI analyst not connected. Check the error above.")
-        st.stop()
+        st.warning("AI analyst not connected. Check the error message above."); st.stop()
 
     chat_obj=st.session_state.chat
-    box=st.container(height=490)
+    box=st.container(height=480)
     with box:
         if not st.session_state.history:
-            route_note=f"Route data source: {schema.route_source}." if schema.route_source else "No route data detected."
-            role_note=(f" Role hierarchy detected: {', '.join(schema.role_cols)}." if schema.role_cols else "")
-            st.markdown(f"""<div style='text-align:center;padding:40px 20px;color:#888'>
+            st.markdown("""<div style='text-align:center;padding:40px 20px;color:#888'>
               <div style='font-size:40px'>🔍</div>
               <div style='font-size:15px;font-weight:600;color:#444;margin:8px 0 4px'>
-                RAG-powered analyst ready.</div>
-              <div style='font-size:13px'>{route_note}{role_note}</div>
+                Analyst ready. Click a question or type below.</div>
             </div>""",unsafe_allow_html=True)
         else:
             for role,msg in st.session_state.history:
@@ -912,34 +802,34 @@ with right:
     user_turns=[r for r,_ in st.session_state.history if r=="user"]
     if not user_turns:
         SUGG=[
-            ("🔎 Full analysis","Give a comprehensive analysis: top issues, trends, anomalies, and a prioritised action plan."),
-            ("🚨 Who needs attention?","Which SRs need immediate managerial attention and why?"),
-            ("📉 Compliance decline","Which SRs have declining compliance? Name specific months and root causes."),
-            ("🛰️ GPS integrity","Are there signs of GPS manipulation or fake check-ins? Provide evidence."),
-            ("🏆 Best performers","Which SRs are performing well or improving? Cite specific metrics."),
-            ("🏪 Skipped stores","Which stores are repeatedly planned but missed? What should be done?"),
+            ("🔎 Full analysis","Comprehensive analysis: top issues, trends, anomalies, action plan."),
+            ("🚨 Needs attention","Which SRs need immediate managerial attention and why?"),
+            ("📉 Compliance drop","Which SRs have declining compliance? Root causes and months."),
+            ("🛰️ GPS check","Signs of GPS manipulation or fake check-ins? Evidence please."),
+            ("🏆 Best performers","Which SRs are performing well or improving? Specific metrics."),
+            ("🏪 Skipped stores","Stores repeatedly planned but missed. What to do?"),
         ]
         if schema.supervisor_col:
-            SUGG.append(("👥 Supervisor performance","Compare supervisor performance. Who oversees the best and worst teams?"))
+            SUGG.append(("👥 Supervisors","Compare supervisor teams. Best and worst performing?"))
         if schema.asm_col:
-            SUGG.append(("🏢 ASM overview","Which ASMs oversee the highest and lowest performing teams?"))
+            SUGG.append(("🏢 ASMs","Which ASMs oversee best and worst performing teams?"))
         cols=st.columns(2)
-        for i,(label,question) in enumerate(SUGG):
+        for i,(label,q) in enumerate(SUGG):
             if cols[i%2].button(label,use_container_width=True,key=f"s{i}"):
-                st.session_state._pq=question; st.rerun()
+                st.session_state._pq=q; st.rerun()
 
-    user_q=st.chat_input("Ask anything about your sales visit data…")
+    user_q=st.chat_input("Ask anything about your sales data…")
     pending=getattr(st.session_state,"_pq",None)
     question=pending or user_q
     if question and chat_obj:
         if pending and hasattr(st.session_state,"_pq"): del st.session_state._pq
         st.session_state.history.append(("user",question))
-        with st.spinner("Searching knowledge base → generating answer…"):
+        with st.spinner("Searching → generating answer…"):
             try: answer=chat_obj.ask(question)
             except Exception as e:
                 err=str(e)
                 if "429" in err or "quota" in err.lower():
-                    answer="⏳ **Rate limit.** Wait ~30s and retry, or enable billing at aistudio.google.com"
-                else: answer=f"⚠️ Error: {e}"
+                    answer="⏳ **Rate limit.** Wait ~30s and retry."
+                else: answer=f"⚠️ Error: {traceback.format_exc()}"
         st.session_state.history.append(("assistant",answer))
         st.rerun()
