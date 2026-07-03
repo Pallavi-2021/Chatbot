@@ -1,0 +1,7 @@
+streamlit
+pandas
+numpy
+plotly
+openpyxl
+python-dateutil
+google-genai
